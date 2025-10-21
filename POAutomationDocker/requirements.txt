@@ -1,0 +1,20 @@
+# Core scientific / OCR
+numpy==1.26.4
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
+# EasyOCR pulls in torch/torchvision; pin CPU-only wheels compatible with slim images
+torch==2.3.1+cpu ; platform_system != "Darwin"
+torchvision==0.18.1+cpu ; platform_system != "Darwin"
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+
+# OCR wrapper
+easyocr==1.7.1
+
+
+# HTTP + utilities
+requests==2.32.3
+
+
+# Optional: better JSON parsing robustness
+orjson==3.10.7
