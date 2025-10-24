@@ -33,7 +33,7 @@ services:
       ERROR_DIR: "/data/error"
       INDEX_DB: "/data/processed_index.sqlite"
       WATCH_USE_POLLING: "1"
-      POLL_INTERVAL: "2.0"
+      POLL_INTERVAL: "15.0"
 
     volumes:
       - input_smb:/input:ro

@@ -32,6 +32,7 @@ TIMEOUT = int(os.getenv("LLM_TIMEOUT", "180"))
 STABLE_CHECK_INTERVAL_SEC = float(os.getenv("STABLE_CHECK_INTERVAL_SEC", "1.0"))
 STABLE_CHECKS = int(os.getenv("STABLE_CHECKS", "3"))
 POLL_INTERVAL_SEC = float(os.getenv("POLL_INTERVAL_SEC", "3.0"))
+MAX_STABILITY_WAIT_SEC = float(os.getenv("MAX_STABILITY_WAIT_SEC", "40"))
 # ===================================================
 
 headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
@@ -48,7 +49,7 @@ def preprocess_image(path: str, out_path: str | None = None):
     return out_path
 """
 
-def ts() -> str:
+def timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def log_append(path: str, *lines: str):
@@ -104,7 +105,7 @@ class ProcessIndex:
                 last_error TEXT,
                 audit_copy TEXT,
                 discovered_at TEXT NOT NULL,
-                processing_started_at TEXT,z
+                processing_started_at TEXT,
                 processed_at TEXT
             );
             """)
@@ -139,7 +140,7 @@ class ProcessIndex:
             # If same exact file+meta exists and is success, treat as already processed.
             existing = cur.execute("SELECT sha256,size,mtime_ns,status FROM files WHERE path=?",
                                    (path,)).fetchone()
-            now = ts()
+            now = timestamp()
             if existing:
                 sha, size, mt, status = existing
                 if (sha, size, mt) == (fp["sha256"], fp["size"], fp["mtime_ns"]):
@@ -166,11 +167,12 @@ class ProcessIndex:
             return bool(row and row[0] == "success")
 
     def mark_processing(self, path: str):
+        print(f"[INFO] Marking processing: {path}")
         with self._conn() as con:
             con.execute("""
                 UPDATE files SET status='processing', processing_started_at=?, attempts=attempts+1
                 WHERE path=?
-            """, (ts(), path))
+            """, (timestamp(), path))
             con.commit()
 
     def mark_result(self, path: str, success: bool, audit_copy: str | None, error: str | None):
@@ -180,14 +182,16 @@ class ProcessIndex:
                 UPDATE files 
                 SET status=?, last_error=?, audit_copy=?, processed_at=?
                 WHERE path=?
-            """, (status, (error or None), (audit_copy or None), ts(), path))
+            """, (status, (error or None), (audit_copy or None), timestamp(), path))
             con.commit()
 
     def get_unprocessed_candidates(self, watch_dir: str) -> list[str]:
         with self._conn() as con:
             rows = con.execute("""
-                SELECT path, status FROM files WHERE status IN ('queued','error','processing')
-            """).fetchall()
+            SELECT path, status 
+            FROM files 
+            WHERE status IN ('queued')  -- exclude 'error' and 'success'
+        """).fetchall()
 
         wd = Path(watch_dir).resolve()
         existing = []
@@ -376,11 +380,13 @@ def wait_until_file_stable(path: str,
     start = time.time()
     if not Path(path).exists():
         return False
-    last_size = -1
+    last_size = None
     stable_count = 0
-    zero_byte_count = 0
 
     while stable_count < checks:
+        if time.time() - start > max_seconds:
+            return False
+
         if not Path(path).exists():
             return False
 
@@ -389,28 +395,25 @@ def wait_until_file_stable(path: str,
         except FileNotFoundError:
             return False
 
-        # If file is 0 bytes, count and bail after a few tries
+        # If file is 0 bytes, bail immediately
         if size == 0:
-            zero_byte_count += 1
-            if zero_byte_count >= checks:
-                return False
-        else:
-            zero_byte_count = 0
+            return False
 
-        if size == last_size and size > 0:
+        if size == last_size:
             stable_count += 1
         else:
             stable_count = 0
             last_size = size
 
-        if time.time() - start > max_seconds:
-            return False
 
-        time.sleep(interval)
+        if stable_count < checks:
+            time.sleep(interval)
+
     return True
 def process_single_pdf(pdf_path: str, auth_mgr=None):
     if auth_mgr is None:
         # fallback for direct calls, but in watch_loop we always pass it
+        print("[INFO] Acquiring JDE token for single PDF processing.")
         session = joc.get_session()
         auth_mgr = JDEAuthManager(session, joc.login_studio_exact_match)
         auth_mgr.refresh()
@@ -430,7 +433,7 @@ def process_single_pdf(pdf_path: str, auth_mgr=None):
 
     # Per-run debug log
     run_log = str(Path(run_frames_dir) / "debug_log.txt")
-    log_append(run_log, f"[{ts()}] === Start run for {pdf_path} ===")
+    log_append(run_log, f"[{timestamp()}] === Start run for {pdf_path} ===")
 
     # Login once per run if session/token not provided
     local_session = jde_session or joc.get_session()
@@ -452,10 +455,10 @@ def process_single_pdf(pdf_path: str, auth_mgr=None):
     try:
         pngs = pdf_to_pngs(pdf_path, run_frames_dir, OUTPUT_PREFIX, DPI)
         print(f"Generated {len(pngs)} page image(s).")
-        log_append(run_log, f"[{ts()}] INFO: Generated {len(pngs)} page image(s)")
+        log_append(run_log, f"[{timestamp()}] INFO: Generated {len(pngs)} page image(s)")
     except Exception as e:
         print("Conversion failed:", e)
-        log_append(run_log, f"[{ts()}] ERROR: {e}")
+        log_append(run_log, f"[{timestamp()}] ERROR: {e}")
         raise
 
     for i, png in enumerate(pngs, start=1):
@@ -467,7 +470,7 @@ def process_single_pdf(pdf_path: str, auth_mgr=None):
             #log ocr text
             ocr_path = str(Path(run_frames_dir) / f"{page_prefix}_ocr.txt")
             write_text(ocr_path, raw_text)
-            log_append(run_log, f"[{ts()}] INFO: OCR written -> {ocr_path}")
+            log_append(run_log, f"[{timestamp()}] INFO: OCR written -> {ocr_path}")
 
             print(f"Sending {Path(png).name} to {BASE_URL} …")
             raw = send_image_and_text_to_llm(preprocessed, raw_text)
@@ -475,7 +478,7 @@ def process_single_pdf(pdf_path: str, auth_mgr=None):
             #log llm raw output
             llm_raw_path = str(Path(run_frames_dir) / f"{file_stem}_llm_raw_page{i}.txt")
             write_text(llm_raw_path, raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, indent=2))
-            log_append(run_log, f"[{ts()}] INFO: LLM raw output written -> {llm_raw_path}")
+            log_append(run_log, f"[{timestamp()}] INFO: LLM raw output written -> {llm_raw_path}")
 
             content = (
                 raw.removeprefix("```json\n")
@@ -484,7 +487,7 @@ def process_single_pdf(pdf_path: str, auth_mgr=None):
             )
             print("LLM cleaned response:", content)
             #log cleaned llm output
-            log_append(run_log, f"[{ts()}] DEBUG: LLM cleaned content length = {len(content)}")
+            log_append(run_log, f"[{timestamp()}] DEBUG: LLM cleaned content length = {len(content)}")
 
             try:
                 payload = parse_llm_json(content)
@@ -492,13 +495,13 @@ def process_single_pdf(pdf_path: str, auth_mgr=None):
                                 # Save parsed JSON payload
                 llm_parsed_path = str(Path(run_frames_dir) / f"{file_stem}_llm_parsed_page{i}.json")
                 write_json(llm_parsed_path, payload)
-                log_append(run_log, f"[{ts()}] INFO: LLM parsed JSON written -> {llm_parsed_path}")
+                log_append(run_log, f"[{timestamp()}] INFO: LLM parsed JSON written -> {llm_parsed_path}")
 
 
             except Exception as pe:
                 msg = f"[PARSE ERROR] {Path(png).name}: {pe}"
                 print(msg)
-                log_append(run_log, f"[{ts()}] ERROR: {msg}")
+                log_append(run_log, f"[{timestamp()}] ERROR: {msg}")
                 combined_sections.append(f"\n{content}\n")
                 continue
 
@@ -547,9 +550,8 @@ def copy_safely(src: str, dst_dir: str) -> str:
     try:
         shutil.copy2(src, target)
     except :
-        log_append(str(Path(dst_dir) / "error_log.txt"), f"[{ts()}] ERROR: Could not copy {src} to {target}")
-    
-        
+        log_append(str(Path(dst_dir) / "error_log.txt"), f"[{timestamp()}] ERROR: Could not copy {src} to {target}")
+
 
     return str(target)
 
@@ -580,40 +582,66 @@ def watch_loop():
             # Enumerate PDFs in the folder
             disk_pdfs = [p for p in glob.glob(str(Path(WATCH_DIR) / "*.pdf")) if p.lower().endswith(".pdf")]
             disk_pdfs = [p for p in disk_pdfs if Path(p).parent.samefile(WATCH_DIR)]
-
+            print(f"[WATCH] Found {len(disk_pdfs)} PDF(s) on disk at {timestamp()}.")
             # Ensure DB has a 'queued' record (or equivalent) for each discovered file
             for pdf in disk_pdfs:
-                idx.upsert_discovered(pdf)
-
+                idx.upsert_discovered(pdf)               
             # Ask DB which items still need attention
             candidates = idx.get_unprocessed_candidates(WATCH_DIR)
+            print(f"[WATCH] {len(candidates)} unprocessed candidate(s).")
 
             for pdf in candidates:
                 # Skip if already success
                 if idx.is_already_processed(pdf):
+                    print(f"[SKIP] Already processed successfully: {pdf}")
                     continue
 
+                # Fail 0-byte files immediately
                 try:
                     if Path(pdf).stat().st_size == 0:
-                        print(f"[SKIP] {pdf} is 0 bytes; will retry when it has content.")
+                        # transition to processing so attempts increments and timestamps get set
+                        idx.mark_processing(pdf)
+                        reason = "File is 0 bytes; marking as error."
+                        print(f"[FAIL] {pdf}: {reason}")
+                        idx.mark_result(pdf, success=False, audit_copy=None, error=reason)
                         continue
                 except FileNotFoundError:
-                        continue
-
-                # Wait until fully written
-                if not wait_until_file_stable(pdf):
+                    # Treat disappearance as a failure, too
+                    idx.mark_processing(pdf)
+                    reason = "File disappeared before processing; marking as error."
+                    print(f"[FAIL] {pdf}: {reason}")
+                    idx.mark_result(pdf, success=False, audit_copy=None, error=reason)
                     continue
 
-                # Ensure we can open (not locked)
+                # Ensure the file stops changing; on timeout, fail (don’t loop forever)
+                idx.mark_processing(pdf)
+                stable = wait_until_file_stable(pdf, max_seconds=MAX_STABILITY_WAIT_SEC)
+                if not stable:
+                    reason = f"File never became stable within {int(MAX_STABILITY_WAIT_SEC)}s (or became 0 bytes/disappeared)."
+                    print(f"[FAIL] {pdf}: {reason}")
+                    try:
+                        copied_path = copy_safely(pdf, ERROR_DIR)
+                    except Exception:
+                        copied_path = None
+                    idx.mark_result(pdf, success=False, audit_copy=copied_path, error=reason)
+                    continue
+
+                # Ensure we can open (not locked) — otherwise fail
                 try:
                     with open(pdf, "rb"):
                         pass
-                except Exception:
+                except Exception as e:
+                    reason = f"File locked/unreadable before processing: {e}"
+                    print(f"[FAIL] {pdf}: {reason}")
+                    try:
+                        copied_path = copy_safely(pdf, ERROR_DIR)
+                    except Exception:
+                        copied_path = None
+                    idx.mark_result(pdf, success=False, audit_copy=copied_path, error=reason)
                     continue
 
                 # Process
                 try:
-                    idx.mark_processing(pdf)
                     ok = process_single_pdf(pdf, auth_mgr=auth_mgr)
                     dst_dir = PROCESSED_DIR if ok else ERROR_DIR
                     copied_path = copy_safely(pdf, dst_dir)
